@@ -85,15 +85,14 @@ class Token:
 TOKEN = Token()
 
 
-def birst(path, method="GET"):
+def birst(path, method="GET", body=None):
     """GET (or the single POST) against Birst; refreshes the token once on 401 for GETs only."""
     for attempt in (1, 2):
         h = {"Authorization": "Bearer " + TOKEN.get(), "Accept": "application/json"}
         data = None
         if method == "POST":
-            # An empty body with no Content-Type gets HTTP 415, so send an empty JSON object.
             h["Content-Type"] = "application/json"
-            data = b"{}"
+            data = json.dumps(body if body is not None else {}).encode()
         st, b = http(BASE + path, data, h, method)
         if st == 401 and method == "GET" and attempt == 1:
             log("GET returned 401; refreshing token")
@@ -164,7 +163,25 @@ def main():
         return 2
     wf = matches[0]
     wid = wf["workflowId"]
-    log(f"workflowId: {wid} | steps: {len(wf.get('steps') or [])}")
+    log(f"workflowId: {wid}")
+
+    # Build the WorkflowCustomRun body from the workflow definition: every step, every task, execute=true.
+    sc, detail = birst(f"/workflows/{wid}")
+    if sc != 200 or not isinstance(detail, dict):
+        log(f"STOP: GET /workflows/{{id}} failed: HTTP {sc} | {scrub(detail)}")
+        return 2
+    run_body = {"steps": []}
+    for s in detail.get("steps") or []:
+        tasks = [{"taskId": t.get("taskId"), "execute": True} for t in s.get("tasks") or []]
+        if not s.get("stepId") or any(not t["taskId"] for t in tasks):
+            log("STOP: workflow definition has a step or task without an id")
+            return 2
+        run_body["steps"].append({"stepId": s["stepId"], "tasks": tasks})
+    n_tasks = sum(len(s["tasks"]) for s in run_body["steps"])
+    log(f"GET /workflows/{{id}}: HTTP {sc} | run body: {len(run_body['steps'])} steps, {n_tasks} tasks (all execute=true)")
+    if not run_body["steps"] or not n_tasks:
+        log("STOP: workflow has no steps or tasks to run")
+        return 2
 
     # 3. check for an in-progress run
     runs = get_all(f"/workflows/{wid}/runs")
@@ -182,7 +199,7 @@ def main():
     prior_ids = {r.get("runId") for r in runs}
 
     # 4. the single write
-    st, j = birst(f"/workflows/{wid}/_runNow", method="POST")
+    st, j = birst(f"/workflows/{wid}/_runNow", method="POST", body=run_body)
     log(f"POST _runNow: HTTP {st}")
     if isinstance(j, dict):
         for k, v in j.items():
@@ -191,7 +208,8 @@ def main():
     if st is None or st >= 300:
         log(f"STOP: _runNow failed (not retrying): {scrub(j)}")
         return 4
-    run_id = j.get("runId") if isinstance(j, dict) else None
+    run_id = (j.get("id") or j.get("runId")) if isinstance(j, dict) else None
+    log(f"runId: {run_id}")
 
     # 5. poll
     start_wall = time.time()
